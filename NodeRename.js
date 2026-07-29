@@ -1,26 +1,28 @@
 /**
  * @Sub-Store-Page
  *
- * NodeRename v1.0.0
+ * NodeRename v1.0.1
  * 高性能落地出口检测与节点重命名脚本
  *
  * 默认输出：
  * 国旗|订阅/商家|ASN 商家|IP 类型|原生/广播
  *
  * 默认策略：
- * 1. 经节点访问 ipapi.is 自查真实出口，并直接复用返回的国家、ASN 和 IP 类型。
- * 2. ipapi.is 自查失败时才访问 Cloudflare Trace，减少正常路径的请求数和等待时间。
+ * 1. 经节点优先访问 IPinfo 自查真实出口和国家；失败时依次回退 ipapi.is 与 Cloudflare Trace。
+ * 2. IPinfo、ipapi.is、Cloudflare 的国家结果分开缓存，避免元数据查询覆盖首选地理来源。
  * 3. 相同节点配置只探测一次；相同出口 IP 的元数据自动合并、去重和批量查询。
  * 4. 分离“节点配置 -> 出口”和“出口 IP -> 元数据”缓存，修改命名参数不会复用错误标签。
  * 5. 默认使用 ASN 国家快速推测原生/广播；只有缺少 ASN 国家时才请求 RIPE。
+ * 6. v1.0.1 升级缓存结构并自动丢弃旧版国家缓存，首次运行会重新探测。
  *
  * 推荐参数：
- * #concurrency=6&probe_source=auto&geo_source=ipapi&native_source=auto&node_ttl=6&ttl=72&stale_ttl=168&mode=prefix&dedupe=1&debug=0
+ * #concurrency=6&probe_source=auto&geo_source=ipinfo&native_source=auto&node_ttl=6&ttl=72&stale_ttl=168&mode=prefix&dedupe=1&debug=0
  *
  * 探测与性能：
  * concurrency=6       节点并发数，建议 4~8
- * probe_source=auto   auto=ipapi 优先、失败回退 CF；ipapi=仅 ipapi；
- *                     cf=仅 CF；dual=并行双检并优先 ipapi
+ * probe_source=auto   auto=IPinfo 优先、失败回退 ipapi/CF；ipinfo=仅 IPinfo；
+ *                     ipapi=仅 ipapi；cf=仅 CF；dual=并行 ipapi+CF
+ * ipinfo_timeout=4500 IPinfo 超时（毫秒）
  * trace_timeout=4000  Cloudflare 单地址超时（毫秒）
  * api_timeout=5500    ipapi.is 超时（毫秒）
  * start_delay=800     HTTP META 启动等待（毫秒）
@@ -35,12 +37,15 @@
  * force_api=0         同时强制刷新 IP/ASN 元数据
  *
  * 数据源：
- * geo_source=ipapi    ipapi=ipapi.is 国家优先；cf=Cloudflare 国家优先
+ * geo_source=ipinfo   ipinfo=IPinfo 国家优先；ipapi=ipapi.is 优先；
+ *                     cf=Cloudflare 优先；consensus=多数优先、平票 IPinfo
  * api_via=auto        auto/direct=后台批量及精确查询；proxy=精确查询经节点
  * key=xxx             ipapi.is API Key，可选；不要写入公开脚本
+ * ipinfo_token=xxx    IPinfo Token，可选；有 Token 自动使用 Lite，无 Token 使用 Legacy
+ * ipinfo_api=auto     auto=有 Token 用 Lite、无 Token 用 Legacy；也可指定 lite/legacy
  * native_check=1      是否显示原生/广播
  * native_source=auto  auto=ASN 国家优先、RIPE 兜底；asn=仅 ASN；ripe=仅 RIPE
- * ripe_vendor=1       ipapi.is 缺少商家时使用 RIPE ASN Holder 兜底
+ * ripe_vendor=1       IPinfo/ipapi 缺少商家时使用 RIPE ASN Holder 兜底
  * ripe_timeout=4500   RIPE 请求超时（毫秒）
  *
  * HTTP META：
@@ -69,12 +74,14 @@
  * 不等同于运营商或数据库的正式“原生 IP”认证。
  */
 
-const SCRIPT_VERSION = "1.0.0";
+const SCRIPT_VERSION = "1.0.1";
 const CACHE_KEY = "node_rename_cache_v1";
-const CACHE_SCHEMA = 1;
+const CACHE_SCHEMA = 2;
 const UNKNOWN = "未知";
 const UNKNOWN_VENDOR = "UNKNOWN";
 const IPAPI_URL = "https://api.ipapi.is";
+const IPINFO_LEGACY_URL = "https://ipinfo.io";
+const IPINFO_LITE_URL = "https://api.ipinfo.io/lite";
 const DEFAULT_TRACE_ENDPOINTS = [
   "https://www.cloudflare.com/cdn-cgi/trace",
   "https://one.one.one.one/cdn-cgi/trace",
@@ -446,6 +453,92 @@ function summarizeIpapi(data) {
   };
 }
 
+function ipinfoOrgParts(data) {
+  const asObject =
+    data?.as && typeof data.as === "object" ? data.as : {};
+  const asnObject =
+    data?.asn && typeof data.asn === "object" ? data.asn : {};
+  const legacyOrg = String(data?.org || "").trim();
+  const legacyMatch = legacyOrg.match(/^AS(\d+)\s+(.+)$/i);
+  const rawAsn =
+    asObject.asn ||
+    asnObject.asn ||
+    (typeof data?.asn === "string" ? data.asn : "") ||
+    legacyMatch?.[1] ||
+    "";
+  const asn = String(rawAsn).replace(/^AS/i, "").trim();
+  const org = String(
+    asObject.name ||
+      data?.as_name ||
+      asnObject.name ||
+      asnObject.org ||
+      legacyMatch?.[2] ||
+      legacyOrg
+  ).trim();
+  return { asn, org };
+}
+
+function ipTypeFromIpinfo(data, org) {
+  if (!data || typeof data !== "object") {
+    return UNKNOWN;
+  }
+  if (positiveFlag(data.is_mobile ?? data.mobile)) {
+    return "移动";
+  }
+  if (positiveFlag(data.is_satellite ?? data.satellite)) {
+    return "卫星";
+  }
+  if (positiveFlag(data.is_hosting ?? data.hosting)) {
+    return "数据中心";
+  }
+
+  const candidates = [
+    data?.as?.type,
+    data?.asn?.type,
+    data?.connection?.type,
+    data?.usage_type,
+    data?.type,
+  ];
+  for (const candidate of candidates) {
+    const mapped = mapIpTypeValue(candidate);
+    if (mapped) {
+      return mapped;
+    }
+  }
+  return (
+    inferIpTypeFromOrganization({
+      asn: {
+        org,
+        descr: data?.as_name || data?.as?.name || data?.asn?.name,
+        domain: data?.as_domain || data?.as?.domain || data?.asn?.domain,
+      },
+    }) || UNKNOWN
+  );
+}
+
+function summarizeIpinfo(data, source = "ipinfo") {
+  const ip = normalizeIp(data?.ip);
+  if (!data || data.error || data.bogon || !ip) {
+    return null;
+  }
+  const { asn, org } = ipinfoOrgParts(data);
+  return {
+    ip,
+    geoCC:
+      normalizeCC(data?.geo?.country_code) ||
+      normalizeCC(data?.country_code) ||
+      normalizeCC(data?.country),
+    asnCC:
+      normalizeCC(data?.as?.country_code) ||
+      normalizeCC(data?.asn?.country_code) ||
+      normalizeCC(data?.asn?.country),
+    asn,
+    org,
+    type: ipTypeFromIpinfo(data, org),
+    source,
+  };
+}
+
 function mergeApiSummary(previous, current) {
   if (!previous || previous.ip !== current?.ip) {
     return current;
@@ -464,6 +557,46 @@ function mergeApiSummary(previous, current) {
   };
 }
 
+function chooseGeoCC(source, ipinfoCC, ipapiCC, traceCC) {
+  const values = {
+    ipinfo: normalizeCC(ipinfoCC),
+    ipapi: normalizeCC(ipapiCC),
+    cf: normalizeCC(traceCC),
+  };
+  if (source !== "consensus") {
+    const order =
+      source === "cf"
+        ? ["cf", "ipinfo", "ipapi"]
+        : source === "ipapi"
+          ? ["ipapi", "ipinfo", "cf"]
+          : ["ipinfo", "ipapi", "cf"];
+    for (const key of order) {
+      if (values[key]) {
+        return values[key];
+      }
+    }
+    return "";
+  }
+
+  const counts = new Map();
+  for (const cc of Object.values(values)) {
+    if (cc) {
+      counts.set(cc, (counts.get(cc) || 0) + 1);
+    }
+  }
+  let bestCount = 0;
+  for (const count of counts.values()) {
+    bestCount = Math.max(bestCount, count);
+  }
+  for (const key of ["ipinfo", "ipapi", "cf"]) {
+    const cc = values[key];
+    if (cc && counts.get(cc) === bestCount) {
+      return cc;
+    }
+  }
+  return "";
+}
+
 function isCompleteApiSummary(summary) {
   return Boolean(
     normalizeIp(summary?.ip) &&
@@ -479,9 +612,10 @@ function ipTypeDiagnostic(data) {
     is_mobile: data?.is_mobile,
     is_satellite: data?.is_satellite,
     is_datacenter: data?.is_datacenter,
+    is_hosting: data?.is_hosting,
     datacenter: data?.datacenter?.datacenter || data?.datacenter?.name,
     company_type: data?.company?.type,
-    asn_type: data?.asn?.type,
+    asn_type: data?.asn?.type || data?.as?.type,
     network_type: data?.network?.type,
     connection_type: data?.connection?.type,
     usage_type: data?.usage_type ?? data?.usageType,
@@ -902,6 +1036,44 @@ function saveApiSummary(cache, summary) {
   return merged;
 }
 
+function ipinfoCacheLookup(
+  cache,
+  ip,
+  freshTtlMs,
+  staleTtlMs,
+  forceFresh = false
+) {
+  return cacheLookup(
+    cache,
+    `ipinfo:${ip}`,
+    freshTtlMs,
+    staleTtlMs,
+    forceFresh
+  );
+}
+
+function saveIpinfoSummary(cache, summary) {
+  if (!summary?.ip || !normalizeCC(summary.geoCC)) {
+    return null;
+  }
+  const key = `ipinfo:${summary.ip}`;
+  const previous = cacheEntry(cache, key)?.value;
+  const merged = mergeApiSummary(previous, summary);
+  saveCacheEntry(cache, key, merged, { quality: "geo" });
+  if (merged.asn && (merged.org || merged.type !== UNKNOWN)) {
+    const previousAsn = cacheEntry(cache, `asn:${merged.asn}`)?.value || {};
+    saveCacheEntry(cache, `asn:${merged.asn}`, {
+      type:
+        merged.type && merged.type !== UNKNOWN
+          ? merged.type
+          : previousAsn.type || UNKNOWN,
+      org: merged.org || previousAsn.org || "",
+      source: merged.source || previousAsn.source || "ipinfo",
+    });
+  }
+  return merged;
+}
+
 function pruneCache(cache, maxAgeMs, maxEntries) {
   const entries = Object.entries(cache.data.entries);
   const currentTime = Date.now();
@@ -937,6 +1109,7 @@ function normalizeDetection(value) {
     ip,
     traceCC: normalizeCC(value?.traceCC),
     apiCC: normalizeCC(value?.apiCC),
+    ipinfoCC: normalizeCC(value?.ipinfoCC),
     source: String(value?.source || "cache"),
   };
 }
@@ -1035,6 +1208,12 @@ async function operator(proxies = []) {
 
   const concurrency = numberArg(args.concurrency, 6, 1, 16);
   const batchConcurrency = numberArg(args.batch_concurrency, 2, 1, 4);
+  const ipinfoTimeout = numberArg(
+    args.ipinfo_timeout || args.timeout,
+    4500,
+    800,
+    30000
+  );
   const traceTimeout = numberArg(
     args.trace_timeout || args.timeout,
     4000,
@@ -1076,12 +1255,30 @@ async function operator(proxies = []) {
   const ripeVendorEnabled = boolArg(args.ripe_vendor, true);
   const probeSource = enumArg(
     args.probe_source,
-    ["auto", "ipapi", "cf", "dual"],
+    ["auto", "ipinfo", "ipapi", "cf", "dual"],
     "auto"
   );
-  const geoSource = enumArg(args.geo_source, ["ipapi", "cf"], "ipapi");
+  const geoSource = enumArg(
+    args.geo_source,
+    ["ipinfo", "ipapi", "cf", "consensus"],
+    "ipinfo"
+  );
   const apiVia = enumArg(args.api_via, ["auto", "direct", "proxy"], "auto");
   const apiKey = String(args.key || "").trim();
+  const ipinfoToken = String(args.ipinfo_token || "").trim();
+  const ipinfoApiOption = enumArg(
+    args.ipinfo_api,
+    ["auto", "lite", "legacy"],
+    "auto"
+  );
+  const ipinfoApi =
+    ipinfoApiOption === "auto"
+      ? ipinfoToken
+        ? "lite"
+        : "legacy"
+      : ipinfoApiOption === "lite" && !ipinfoToken
+        ? "legacy"
+        : ipinfoApiOption;
   const vendorMaxLength = numberArg(args.vendor_len, 16, 6, 24);
   const nameLength = numberArg(args.name_len, 95, 40, 160);
   const separator = String(args.separator || "|").slice(0, 3) || "|";
@@ -1134,6 +1331,10 @@ async function operator(proxies = []) {
     coreNodes: 0,
     unsupported: 0,
     probed: 0,
+    ipinfoSelfOk: 0,
+    ipinfoSelfFail: 0,
+    ipinfoCache: 0,
+    ipinfoExact: 0,
     selfOk: 0,
     selfFail: 0,
     traceOk: 0,
@@ -1148,6 +1349,7 @@ async function operator(proxies = []) {
     ripeVendor: 0,
     failed: 0,
   };
+  const geoConflictKeys = new Set();
 
   function addFailure(index, stage, error) {
     if (failures.length >= 30) {
@@ -1157,17 +1359,38 @@ async function operator(proxies = []) {
     failures.push(`${prefix}${stage}: ${errorText(error)}`);
   }
 
-  function addConflict(index, trace, selfApi) {
+  function addGeoConflict(index, ip, sources, chosen) {
+    const available = Object.entries(sources).filter(([, cc]) =>
+      normalizeCC(cc)
+    );
+    if (new Set(available.map(([, cc]) => normalizeCC(cc))).size < 2) {
+      return;
+    }
+    const key = normalizeIp(ip) || `node:${index}`;
+    if (geoConflictKeys.has(key)) {
+      return;
+    }
+    geoConflictKeys.add(key);
     stats.conflicts++;
     if (!debug || diagnostics.length >= 20) {
       return;
     }
     diagnostics.push(
-      `#${index + 1} Cloudflare=${trace?.ip || "无"}/${
-        trace?.geoCC || UNKNOWN
-      }, ipapi.is=${selfApi?.summary?.ip || "无"}/${
-        selfApi?.summary?.geoCC || UNKNOWN
-      }，采用 ipapi.is`
+      `#${index + 1} 国家冲突 IP=${key}: ${available
+        .map(([source, cc]) => `${source}=${normalizeCC(cc)}`)
+        .join(", ")}，采用 ${normalizeCC(chosen) || UNKNOWN}`
+    );
+  }
+
+  function addConflict(index, trace, selfApi) {
+    addGeoConflict(
+      index,
+      selfApi?.summary?.ip || trace?.ip,
+      {
+        Cloudflare: trace?.geoCC,
+        "ipapi.is": selfApi?.summary?.geoCC,
+      },
+      selfApi?.summary?.geoCC || trace?.geoCC
     );
   }
 
@@ -1251,9 +1474,64 @@ async function operator(proxies = []) {
 
   let core = null;
   const coreGroups = groups.filter((group) => group.needsCore);
+  const ipinfoRefreshed = new Set();
 
   function proxyUrlForPort(port) {
     return `http://${metaHost}:${port}`;
+  }
+
+  function ipinfoUrl(ip = "") {
+    const target =
+      ipinfoApi === "lite" ? ip || "me" : ip ? `${ip}/json` : "json";
+    const base =
+      ipinfoApi === "lite" ? IPINFO_LITE_URL : IPINFO_LEGACY_URL;
+    const query = ipinfoToken
+      ? `?token=${encodeURIComponent(ipinfoToken)}`
+      : "";
+    return `${base}/${target}${query}`;
+  }
+
+  async function fetchIpinfo(ip, proxyUrl, label) {
+    const response = assertResponse(
+      await $.http.get({
+        url: ipinfoUrl(ip),
+        timeout: ipinfoTimeout,
+        ...(proxyUrl ? { proxy: proxyUrl } : {}),
+        headers: {
+          accept: "application/json",
+          "user-agent": `NodeRename/${SCRIPT_VERSION}`,
+        },
+      }),
+      label
+    );
+    const data = safeJson(response.body, null);
+    if (!data || data.error || data.bogon) {
+      throw new Error(
+        data?.error?.message ||
+          data?.error?.title ||
+          data?.error ||
+          (data?.bogon ? "返回保留/私有地址" : "返回无效 JSON")
+      );
+    }
+    const summary = summarizeIpinfo(
+      data,
+      ipinfoApi === "lite" ? "ipinfo-lite" : "ipinfo-legacy"
+    );
+    if (!summary || !normalizeCC(summary.geoCC)) {
+      throw new Error("未返回有效出口 IP 或国家");
+    }
+    if (ip && summary.ip !== ip) {
+      throw new Error("返回 IP 与查询 IP 不一致");
+    }
+    return { raw: data, summary };
+  }
+
+  async function fetchSelfIpinfo(proxyUrl) {
+    return fetchIpinfo("", proxyUrl, "IPinfo 出口自查");
+  }
+
+  async function exactIpinfo(ip) {
+    return fetchIpinfo(ip, "", "IPinfo 精确查询");
   }
 
   async function fetchCloudflareTrace(proxyUrl) {
@@ -1466,14 +1744,24 @@ async function operator(proxies = []) {
 
       if (converted.length) {
         const rounds = Math.ceil(converted.length / concurrency);
-        const probeWorst =
-          probeSource === "cf"
-            ? traceEndpoints.length * traceTimeout
-            : probeSource === "ipapi"
-              ? apiTimeout
-              : probeSource === "dual"
-                ? Math.max(apiTimeout, traceEndpoints.length * traceTimeout)
-                : apiTimeout + traceEndpoints.length * traceTimeout;
+        let probeWorst;
+        if (probeSource === "cf") {
+          probeWorst = traceEndpoints.length * traceTimeout;
+        } else if (probeSource === "ipinfo") {
+          probeWorst = ipinfoTimeout;
+        } else if (probeSource === "ipapi") {
+          probeWorst = apiTimeout;
+        } else if (probeSource === "dual") {
+          probeWorst = Math.max(
+            apiTimeout,
+            traceEndpoints.length * traceTimeout
+          );
+        } else {
+          probeWorst =
+            ipinfoTimeout +
+            apiTimeout +
+            traceEndpoints.length * traceTimeout;
+        }
         const coreLifetime = Math.min(
           1800000,
           Math.max(60000, startDelay + rounds * (probeWorst + 1000) + 10000)
@@ -1513,18 +1801,28 @@ async function operator(proxies = []) {
           concurrency,
           async ({ group }) => {
             stats.probed++;
+            let selfIpinfo = null;
             let trace = null;
             let selfApi = null;
 
-            if (probeSource === "auto" || probeSource === "ipapi") {
+            if (probeSource === "auto" || probeSource === "ipinfo") {
               try {
-                selfApi = await fetchSelfIpapi(group.proxyUrl);
-                stats.selfOk++;
+                selfIpinfo = await fetchSelfIpinfo(group.proxyUrl);
+                stats.ipinfoSelfOk++;
               } catch (error) {
-                stats.selfFail++;
-                addFailure(group.firstIndex, "ipapi.is 出口自查", error);
+                stats.ipinfoSelfFail++;
+                addFailure(group.firstIndex, "IPinfo 出口自查", error);
               }
-              if (!selfApi && probeSource === "auto") {
+              if (!selfIpinfo && probeSource === "auto") {
+                try {
+                  selfApi = await fetchSelfIpapi(group.proxyUrl);
+                  stats.selfOk++;
+                } catch (error) {
+                  stats.selfFail++;
+                  addFailure(group.firstIndex, "ipapi.is 出口自查", error);
+                }
+              }
+              if (!selfIpinfo && !selfApi && probeSource === "auto") {
                 try {
                   trace = await fetchCloudflareTrace(group.proxyUrl);
                   stats.traceOk++;
@@ -1532,6 +1830,14 @@ async function operator(proxies = []) {
                   stats.traceFail++;
                   addFailure(group.firstIndex, "Cloudflare 兜底", error);
                 }
+              }
+            } else if (probeSource === "ipapi") {
+              try {
+                selfApi = await fetchSelfIpapi(group.proxyUrl);
+                stats.selfOk++;
+              } catch (error) {
+                stats.selfFail++;
+                addFailure(group.firstIndex, "ipapi.is 出口自查", error);
               }
             } else if (probeSource === "cf") {
               try {
@@ -1576,10 +1882,28 @@ async function operator(proxies = []) {
               }
             }
 
-            if (selfApi) {
+            if (selfIpinfo) {
+              group.detection = {
+                ip: selfIpinfo.summary.ip,
+                ipinfoCC: selfIpinfo.summary.geoCC,
+                apiCC: "",
+                traceCC: "",
+                source: selfIpinfo.summary.source,
+              };
+              saveIpinfoSummary(cache, selfIpinfo.summary);
+              ipinfoRefreshed.add(selfIpinfo.summary.ip);
+              if (selfIpinfo.summary.type === UNKNOWN) {
+                logUnknownType(
+                  group.firstIndex,
+                  "IPinfo 出口自查",
+                  selfIpinfo.raw
+                );
+              }
+            } else if (selfApi) {
               const sameIp = trace?.ip === selfApi.summary.ip;
               group.detection = {
                 ip: selfApi.summary.ip,
+                ipinfoCC: "",
                 apiCC: selfApi.summary.geoCC,
                 traceCC: sameIp ? trace?.geoCC || "" : "",
                 source: "ipapi.is-self",
@@ -1595,6 +1919,7 @@ async function operator(proxies = []) {
             } else if (trace) {
               group.detection = {
                 ip: trace.ip,
+                ipinfoCC: "",
                 apiCC: "",
                 traceCC: trace.geoCC,
                 source: trace.source,
@@ -1637,6 +1962,45 @@ async function operator(proxies = []) {
     }
   }
   const uniqueIps = Array.from(detectionByIp.keys());
+
+  if (geoSource === "ipinfo" || geoSource === "consensus") {
+    const ipinfoMissing = [];
+    for (const ip of uniqueIps) {
+      const lookup = ipinfoCacheLookup(
+        cache,
+        ip,
+        ttlMs,
+        staleTtlMs,
+        forceApi && !ipinfoRefreshed.has(ip)
+      );
+      if (lookup.fresh) {
+        if (!ipinfoRefreshed.has(ip)) {
+          stats.ipinfoCache++;
+        }
+      } else {
+        ipinfoMissing.push(ip);
+      }
+    }
+
+    await mapLimit(
+      ipinfoMissing,
+      Math.min(concurrency, 6),
+      async (ip) => {
+        try {
+          const result = await exactIpinfo(ip);
+          saveIpinfoSummary(cache, result.summary);
+          ipinfoRefreshed.add(ip);
+          stats.ipinfoExact++;
+        } catch (error) {
+          addFailure(
+            detectionByIp.get(ip)?.firstIndex || 0,
+            "IPinfo 精确查询",
+            error
+          );
+        }
+      }
+    );
+  }
 
   try {
     const apiMissing = [];
@@ -1771,11 +2135,29 @@ async function operator(proxies = []) {
     }
   }
 
+  const ipinfoByIp = new Map();
+  for (const ip of uniqueIps) {
+    const lookup = ipinfoCacheLookup(
+      cache,
+      ip,
+      ttlMs,
+      staleTtlMs,
+      false
+    );
+    if (lookup.value && (lookup.fresh || lookup.stale)) {
+      ipinfoByIp.set(ip, lookup.value);
+    }
+  }
+
   const rirNeeded = [];
   if (shouldResolveNative) {
     for (const ip of uniqueIps) {
       const api = apiByIp.get(ip);
-      if (nativeSource === "auto" && normalizeCC(api?.asnCC)) {
+      const ipinfo = ipinfoByIp.get(ip);
+      if (
+        nativeSource === "auto" &&
+        normalizeCC(api?.asnCC || ipinfo?.asnCC)
+      ) {
         stats.nativeFast++;
         continue;
       }
@@ -1798,7 +2180,7 @@ async function operator(proxies = []) {
   const vendorNeeded = [];
   if (ripeVendorEnabled && options.showVendor) {
     for (const ip of uniqueIps) {
-      if (apiByIp.get(ip)?.org) {
+      if (apiByIp.get(ip)?.org || ipinfoByIp.get(ip)?.org) {
         continue;
       }
       const lookup = cacheLookup(
@@ -1862,6 +2244,7 @@ async function operator(proxies = []) {
         apiLookup.value && (apiLookup.fresh || apiLookup.stale)
           ? apiLookup.value
           : null;
+      const ipinfo = ipinfoByIp.get(detection.ip) || null;
       const vendorLookup = cacheLookup(
         cache,
         `vendor:${detection.ip}`,
@@ -1873,7 +2256,9 @@ async function operator(proxies = []) {
         vendorLookup.value && (vendorLookup.fresh || vendorLookup.stale)
           ? vendorLookup.value
           : null;
-      const asn = String(api?.asn || ripeVendor?.asn || "").replace(/^AS/i, "");
+      const asn = String(
+        api?.asn || ipinfo?.asn || ripeVendor?.asn || ""
+      ).replace(/^AS/i, "");
       const asnLookup = asn
         ? cacheLookup(cache, `asn:${asn}`, ttlMs, staleTtlMs, false)
         : { value: null, fresh: false, stale: false };
@@ -1893,21 +2278,41 @@ async function operator(proxies = []) {
           ? normalizeCC(rirLookup.value)
           : "";
 
+      const ipinfoCC = normalizeCC(
+        ipinfo?.geoCC || detection.ipinfoCC
+      );
       const apiCC = normalizeCC(api?.geoCC || detection.apiCC);
       const traceCC = normalizeCC(detection.traceCC);
-      const geoCC =
-        geoSource === "cf" ? traceCC || apiCC : apiCC || traceCC;
+      const geoCC = chooseGeoCC(
+        geoSource,
+        ipinfoCC,
+        apiCC,
+        traceCC
+      );
+      addGeoConflict(
+        group.firstIndex,
+        detection.ip,
+        {
+          IPinfo: ipinfoCC,
+          "ipapi.is": apiCC,
+          Cloudflare: traceCC,
+        },
+        geoCC
+      );
       const registrationCC =
         nativeSource === "ripe"
           ? rirCC
           : nativeSource === "asn"
-            ? normalizeCC(api?.asnCC)
-            : normalizeCC(api?.asnCC) || rirCC;
-      const org = api?.org || ripeVendor?.org || asnInfo?.org || "";
+            ? normalizeCC(api?.asnCC || ipinfo?.asnCC)
+            : normalizeCC(api?.asnCC || ipinfo?.asnCC) || rirCC;
+      const org =
+        api?.org || ipinfo?.org || ripeVendor?.org || asnInfo?.org || "";
       const type =
         api?.type && api.type !== UNKNOWN
           ? api.type
-          : asnInfo?.type || UNKNOWN;
+          : ipinfo?.type && ipinfo.type !== UNKNOWN
+            ? ipinfo.type
+            : asnInfo?.type || UNKNOWN;
 
       geo = {
         ip: detection.ip,
@@ -1963,6 +2368,8 @@ async function operator(proxies = []) {
       }, 批内去重=${stats.duplicateSaved}, 出口缓存=${stats.routeCache}, ` +
         `旧出口缓存=${stats.routeStale}, 核心节点=${stats.coreNodes}, ` +
         `不支持=${stats.unsupported}, 实测=${stats.probed}, ` +
+        `IPinfo自查=${stats.ipinfoSelfOk}/${stats.ipinfoSelfFail}, ` +
+        `IPinfo缓存=${stats.ipinfoCache}, IPinfo精确=${stats.ipinfoExact}, ` +
         `ipapi自查=${stats.selfOk}/${stats.selfFail}, ` +
         `CF=${stats.traceOk}/${stats.traceFail}, 冲突=${stats.conflicts}, ` +
         `IP缓存=${stats.apiCache}, 批量请求=${stats.apiBatchRequests}, ` +
