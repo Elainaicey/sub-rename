@@ -9,7 +9,7 @@
 | [NodeRename.js](./NodeRename.js) | 需要识别真实落地出口、ASN、IP 类型和原生/广播 | IPinfo、ipapi.is、Cloudflare Trace、RIPE | 信息更完整，支持缓存、批量查询和并发探测 |
 | [CloudRename.js](./CloudRename.js) | 只根据节点名称和元数据快速整理节点 | 本地规则，无外部请求 | 运行快、零网络依赖，支持大量地区和线路标签 |
 
-当前版本：`NodeRename v1.0.2`、`CloudRename v1.1.1`。
+当前版本：`NodeRename v1.0.2`、`CloudRename v1.1.2`。
 
 ## NodeRename
 
@@ -64,25 +64,25 @@
 
 ## CloudRename
 
-`CloudRename.js` 不请求任何外部 API，只根据节点名称、国旗、国家代码和节点元数据识别地区，并提取等级、线路、IP 属性、用途、倍率和协议。v1.1.1 扩充了尊享、铂金、专业、内测等等级及线路/流媒体别名；还可保留 `【樱花专享】`、`等级:星耀` 等明确标注的未知描述。标签去重后仍按原名顺序展示，但数量或长度受限时会优先保留等级、倍率和协议。
+`CloudRename.js` 不请求任何外部 API，只根据节点名称、国旗、国家代码和节点元数据识别地区，并提取等级、线路、IP 属性、用途和倍率。v1.1.2 起不再把客户端已显示的协议写入节点名。脚本还可保留 `【樱花专享】`、`等级:星耀` 等明确标注的未知描述；标签去重后仍按原名顺序展示，但数量或长度受限时会优先保留等级和倍率。
 
 默认输出格式：
 
 ```text
-国旗|机场名|地区序号|描述标签…|倍率|协议
+国旗|机场名|地区序号|描述标签…|倍率
 ```
 
 输出示例：
 
 ```text
-🇭🇰|XSUS|香港01|0.8x|ANYTLS
-🇭🇰|FlowerCloud|香港01|高级|IEPL|专线|原生|住宅|ChatGPT|0.8x|TROJAN
+🇭🇰|XSUS|香港01|0.8x
+🇭🇰|FlowerCloud|香港01|高级|IEPL|专线|原生|住宅|ChatGPT|0.8x
 ```
 
 推荐参数：
 
 ```text
-#drop_info=1&mode=prefix&show_line=1&max_tags=24&show_extra=1&show_rate=1&show_proto=1&dedupe=1
+#drop_info=1&mode=prefix&show_line=1&max_tags=24&show_extra=1&show_rate=1&dedupe=1
 ```
 
 常用参数：
@@ -105,7 +105,6 @@
 | `show_feature` | `1` | 游戏、流媒体、解锁、AI、备用、低延迟等用途 |
 | `show_extra` | `1` | 提取括号或 `等级:名称`、`线路:名称` 等明确标注的未知描述 |
 | `show_rate` | `1` | 是否显示节点倍率 |
-| `show_proto` | `1` | 是否显示协议、传输及 TLS/REALITY |
 | `max_tags` | `24` | 单个节点最多保留的描述标签数量，可设为 `0`；`max_line_tags` 为兼容别名 |
 | `custom_tags` | 空 | 额外提取词，逗号分隔，如 `静态住宅,精品线路`；按字面匹配，不执行正则 |
 | `seq_width` | `2` | 地区序号最小宽度，范围为 1～4 |
@@ -116,7 +115,7 @@
 
 完整参数说明位于 [CloudRename.js](./CloudRename.js) 文件开头。
 
-例如只想保留线路、倍率和协议，可设置 `show_tier=0&show_ip_type=0&show_feature=0&show_extra=0`。未收录且没有明确标注的机场专用词，可通过 `custom_tags` 添加；脚本不会猜测任意自由文本的含义。节点原名中的“住宅”“原生”等只是宣称信息，脚本不会探测出口 IP；需要真实出口检测时请使用 `NodeRename.js`。
+例如只想保留线路和倍率，可设置 `show_tier=0&show_ip_type=0&show_feature=0&show_extra=0`。旧版 `show_proto` 参数现在会被忽略。未收录且没有明确标注的机场专用词，可通过 `custom_tags` 添加；脚本不会猜测任意自由文本的含义。节点原名中的“住宅”“原生”等只是宣称信息，脚本不会探测出口 IP；需要真实出口检测时请使用 `NodeRename.js`。
 
 ## 使用方法
 
@@ -125,7 +124,7 @@
 3. 根据需要在脚本链接末尾追加参数，例如：
 
 ```text
-CloudRename.js#provider=MyCloud&show_rate=1&show_proto=1
+CloudRename.js#provider=MyCloud&show_rate=1
 ```
 
 4. 将脚本添加到订阅或节点操作流程并运行。

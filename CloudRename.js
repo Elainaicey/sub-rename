@@ -1,15 +1,18 @@
 /**
  * @Sub-Store-Page
  *
- * CloudRename v1.1.1
+ * CloudRename v1.1.2
  * 本地机场节点分类、信息提取与重命名脚本
  *
  * 输出格式：
- * 国旗|机场名|地区序号|等级/线路/IP 属性/用途|倍率|协议
+ * 国旗|机场名|地区序号|等级/线路/IP 属性/用途|倍率
  *
  * 示例：
- * 🇭🇰|XSUS|香港01|0.8x|ANYTLS
- * 🇭🇰|FlowerCloud|香港01|实验性|IEPL|专线|TROJAN
+ * 🇭🇰|XSUS|香港01|0.8x
+ * 🇭🇰|FlowerCloud|香港01|实验性|IEPL|专线
+ *
+ * v1.1.2 优化：
+ * - 客户端已能显示协议，不再把协议/传输/TLS 写入节点名
  *
  * v1.1.1 优化：
  * - 更多等级/线路/IP/流媒体别名，识别括号中的自定义描述
@@ -22,9 +25,8 @@
  * - 精确代码、机场代码、国旗、长别名和节点元数据组成分层识别路径
  * - 修复 CN2 被识别为中国、IN01/IT01/NO01/IS01 漏判等边界问题
  * - 从节点名提取等级、线路、IP 属性、用途、倍率和自定义标签
- * - 标签按原名出现顺序输出，长名称优先保留倍率与协议
+ * - 标签按原名出现顺序输出，长名称优先保留倍率
  * - 过滤规则、标签规则、倍率规则全部预编译
- * - 协议/传输/TLS/REALITY 合并输出，支持更多 Sub-Store 字段
  * - 同名节点使用无碰撞去重，长名称也会为 #2/#3 完整预留空间
  * - mode=off 时真正不修改名称，也不会再被 dedupe 追加 #2/#3
  * - 支持自定义分隔符、名称长度、序号宽度及输出字段
@@ -33,7 +35,6 @@
  * 参数：
  * drop_info=1       过滤流量/到期/官网/通知类伪节点，默认 1
  * mode=prefix       prefix=覆盖为新名；suffix=追加到原名后；off=不改名
- * show_proto=1      显示协议，默认 1
  * show_line=1       显示所有描述标签的总开关，默认 1
  * show_tier=1       显示高级/标准/旗舰/实验性等等级标签
  * show_route=1      显示 IEPL/IPLC/CN2/专线/中转等线路标签
@@ -58,10 +59,10 @@
  * debug=0           输出耗时、过滤及识别统计
  *
  * 推荐参数：
- * #drop_info=1&mode=prefix&show_line=1&max_tags=24&show_rate=1&show_proto=1&dedupe=1
+ * #drop_info=1&mode=prefix&show_line=1&max_tags=24&show_rate=1&dedupe=1
  */
 
-const SCRIPT_VERSION = "1.1.1";
+const SCRIPT_VERSION = "1.1.2";
 
 const UNKNOWN_REGION = Object.freeze({
   code: "OT",
@@ -232,15 +233,6 @@ const EXTRA_FIELD_RE =
   /(等级|等級|级别|級別|档位|檔位|套餐|计划|計劃|版型|线路|線路|特性|标签|標籤)\s*[:：=]\s*([A-Za-z0-9\u00c0-\u024f\u3400-\u9fff+_.-]{2,16})/g;
 
 const MODE_VALUES = new Set(["prefix", "suffix", "off"]);
-const PROTOCOL_LABELS = Object.freeze({
-  HYSTERIA2: "HY2",
-  HY2: "HY2",
-  HYSTERIA: "HY",
-  SHADOWSOCKS: "SS",
-  SHADOWSOCKSR: "SSR",
-  SOCKS5: "SOCKS",
-  WIREGUARD: "WG",
-});
 const PROTOCOL_NAME_RE =
   /^(?:vless|vmess|trojan|ss|ssr|shadowsocks|hysteria2?|hy2|tuic|anytls|wireguard|socks5?|http)$/i;
 const REGION_PART_SPLIT_RE = /[\s|｜_\-/\\:：,，.;；()[\]{}<>]+/;
@@ -540,7 +532,6 @@ function operator(proxies = []) {
   const options = {
     dropInfo: argBool(args.drop_info, true),
     mode,
-    showProto: argBool(args.show_proto, true),
     showLine: argBool(args.show_line, true),
     showTier: argBool(args.show_tier, true),
     showRoute: argBool(args.show_route, true),
@@ -696,7 +687,6 @@ function operator(proxies = []) {
         ? detectTags(tagMatches || [], options)
         : [],
       rate: options.showRate ? detectRate(oldName, proxy) : "",
-      proto: options.showProto ? protoLabel(proxy) : "",
     }, options);
 
     proxy.name = applyMode(
@@ -772,7 +762,7 @@ function truncateText(value, maxLength) {
 function buildName(data, options) {
   const separator = options.separator;
   const head = [data.flag, data.provider, data.regionLabel].filter(Boolean);
-  const tail = [data.rate, data.proto].filter(Boolean);
+  const tail = data.rate ? [data.rate] : [];
   const selected = [];
   let length = head.join(separator).length;
   const tailLength = tail.join(separator).length;
@@ -1350,43 +1340,6 @@ function detectRate(name, proxy) {
   return Number.isFinite(rate) && rate > 0 && rate <= 1000
     ? `${rate}x`
     : "";
-}
-
-function protoLabel(proxy) {
-  const rawType = String(
-    proxy?.type || proxy?.protocol || ""
-  ).toUpperCase();
-  const network = String(
-    proxy?.network || proxy?.transport || proxy?.net || ""
-  ).toUpperCase();
-  if (!rawType) {
-    return "";
-  }
-
-  const proto = PROTOCOL_LABELS[rawType] || rawType;
-  const transport =
-    network && network !== "TCP" && network !== "RAW" ? network : "";
-  const securityValue = String(proxy?.security || "").toLowerCase();
-  const flow = String(proxy?.flow || "").toLowerCase();
-  const hasReality =
-    argBool(proxy?.reality, false) ||
-    securityValue.includes("reality") ||
-    flow.includes("xtls-rprx");
-  const hasTls =
-    !hasReality &&
-    (argBool(proxy?.tls, false) ||
-      securityValue === "tls" ||
-      securityValue === "xtls");
-  const security = hasReality ? "REALITY" : hasTls ? "TLS" : "";
-
-  let label = proto;
-  if (transport) {
-    label += `-${transport}`;
-  }
-  if (security) {
-    label += `-${security}`;
-  }
-  return label;
 }
 
 function dedupeNames(proxies, nameLength) {
