@@ -1,7 +1,7 @@
 /**
  * @Sub-Store-Page
  *
- * CloudRename v1.1.0
+ * CloudRename v1.1.1
  * 本地机场节点分类、信息提取与重命名脚本
  *
  * 输出格式：
@@ -11,7 +11,12 @@
  * 🇭🇰|XSUS|香港01|0.8x|ANYTLS
  * 🇭🇰|FlowerCloud|香港01|实验性|IEPL|专线|TROJAN
  *
- * v1.1.0 优化：
+ * v1.1.1 优化：
+ * - 更多等级/线路/IP/流媒体别名，识别括号中的自定义描述
+ * - 名称长度或标签数量受限时优先保留等级，再按原名顺序展示
+ * - 无法可靠判断的自由文本不猜测为标签，避免混入机场名或地区
+ *
+ * 既有能力：
  * - 不检测落地 IP，不请求任何外部 API
  * - 地区别名只标准化一次，大订阅自动切换为 O(节点名长度) 的自动机匹配
  * - 精确代码、机场代码、国旗、长别名和节点元数据组成分层识别路径
@@ -38,9 +43,10 @@
  * dedupe=1          重名节点追加 #2/#3，默认 1；mode=off 时不生效
  * provider=xxx      手动覆盖机场名
  * keep_unknown=1    保留未识别地区节点，默认 1
- * max_tags=12       最多保留的描述标签数，默认 12
- * max_line_tags=12  max_tags 的兼容别名
+ * max_tags=24       最多保留的描述标签数，默认 24
+ * max_line_tags=24  max_tags 的兼容别名
  * custom_tags=xxx   额外关键词，逗号分隔，如 静态住宅,精品线路
+ * show_extra=1      保留括号或“等级:星耀”等明示的未收录描述；默认 1
  * use_metadata=1    名称未命中时读取节点国家/地区元数据，默认 1
  * show_flag=1       显示国旗，默认 1
  * show_provider=1   显示机场名，默认 1
@@ -52,10 +58,10 @@
  * debug=0           输出耗时、过滤及识别统计
  *
  * 推荐参数：
- * #drop_info=1&mode=prefix&show_line=1&max_tags=12&show_rate=1&show_proto=1&dedupe=1
+ * #drop_info=1&mode=prefix&show_line=1&max_tags=24&show_rate=1&show_proto=1&dedupe=1
  */
 
-const SCRIPT_VERSION = "1.1.0";
+const SCRIPT_VERSION = "1.1.1";
 
 const UNKNOWN_REGION = Object.freeze({
   code: "OT",
@@ -108,6 +114,16 @@ const TAG_RULES = Object.freeze([
   [/\b(?:AS)?4837\b/i, "AS4837", "route"],
   [/\bCU\s*(?:VIP|II)\b/i, "CU VIP", "route"],
   [/\bBGP\b/i, "BGP", "route"],
+  [/三网优化|三網優化|三网回程|三網回程/i, "三网优化", "route"],
+  [/三网直连|三網直連/i, "三网直连", "route"],
+  [/精品网|精品網/i, "精品网", "route"],
+  [/\bMPLS\b/i, "MPLS", "route"],
+  [/\bIIJ\b/i, "IIJ", "route"],
+  [/\bNTT\b/i, "NTT", "route"],
+  [/\bBBTEC\b/i, "BBTEC", "route"],
+  [/\bPCCW\b/i, "PCCW", "route"],
+  [/\bHKT\b/i, "HKT", "route"],
+  [/\bSoftBank\b/i, "SoftBank", "route"],
   [/专线|專線|\b(?:dedicated|private)\s+line\b/i, "专线", "route"],
   [/中转|中轉|中繼|\brelay\b/i, "中转", "route"],
   [/隧道|\btunnel\b/i, "隧道", "route"],
@@ -115,10 +131,27 @@ const TAG_RULES = Object.freeze([
   [/落地|\bexit\s*(?:node|server)?\b/i, "落地", "route"],
   [/入口|\bentry\s*(?:node|server)?\b/i, "入口", "route"],
   [/实验性|實驗性|\bexperimental\b/i, "实验性", "tier"],
+  [/实验|實驗|试验|試驗|\bpreview\b/i, "实验", "tier"],
   [/测试|測試|\b(?:test|beta)\b/i, "测试", "tier"],
+  [/内测|內測|\b(?:alpha|internal\s*test)\b/i, "内测", "tier"],
+  [/公测|公測|\bpublic\s*beta\b/i, "公测", "tier"],
   [/旗舰|旗艦|\bflagship\b/i, "旗舰", "tier"],
   [/高级|高級|\bpremium\b/i, "高级", "tier"],
+  [/高端/i, "高端", "tier"],
+  [/顶级|頂級/i, "顶级", "tier"],
+  [/至尊/i, "至尊", "tier"],
+  [/尊享/i, "尊享", "tier"],
+  [/臻享/i, "臻享", "tier"],
+  [/优选|優選/i, "优选", "tier"],
+  [/优享|優享/i, "优享", "tier"],
+  [/精选|精選/i, "精选", "tier"],
+  [/专业|專業|\bpro\b/i, "专业", "tier"],
+  [/进阶|進階|\badvanced\b/i, "进阶", "tier"],
   [/标准|標準|\bstandard\b/i, "标准", "tier"],
+  [/黄金|黃金|\bgold\b/i, "黄金", "tier"],
+  [/铂金|鉑金|白金|\bplatinum\b/i, "铂金", "tier"],
+  [/钻石|鑽石|\bdiamond\b/i, "钻石", "tier"],
+  [/白银|白銀|\bsilver\b/i, "白银", "tier"],
   [/精品|\belite\b/i, "精品", "tier"],
   [/基础|基礎|入门|入門|\bbasic\b/i, "基础", "tier"],
   [/普通|\bnormal\b/i, "普通", "tier"],
@@ -127,10 +160,18 @@ const TAG_RULES = Object.freeze([
   [/企业|企業|\benterprise\b/i, "企业", "tier"],
   [/商务|商務|\bbusiness\b/i, "商务", "tier"],
   [/轻量|輕量|\blite\b/i, "轻量", "tier"],
+  [/试用|試用|\btrial\b/i, "试用", "tier"],
+  [/体验|體驗/i, "体验", "tier"],
+  [/限量/i, "限量", "tier"],
+  [/限定|\blimited\b/i, "限定", "tier"],
+  [/\bplus\b/i, "PLUS", "tier"],
+  [/\bultra\b/i, "ULTRA", "tier"],
+  [/\bmax\b/i, "MAX", "tier"],
   [/免费|\bfree\b/i, "免费", "tier"],
   [/双ISP|雙ISP|\bdual\s*isp\b/i, "双ISP", "ip"],
   [/\bISP\b/i, "ISP", "ip"],
   [/家宽|家寬|\bhome\s*(?:broadband|ip)\b/i, "家宽", "ip"],
+  [/家庭宽带|家庭寬頻|家庭宽頻/i, "家宽", "ip"],
   [/住宅(?:IP)?|\bresidential(?:\s*ip)?\b/i, "住宅", "ip"],
   [/原生(?:IP)?|\bnative\s*ip\b/i, "原生", "ip"],
   [/商宽|商寬|\bbusiness\s*broadband\b/i, "商宽", "ip"],
@@ -142,6 +183,7 @@ const TAG_RULES = Object.freeze([
   [/广播(?:IP)?|廣播(?:IP)?|\bbroadcast\s*ip\b/i, "广播", "ip"],
   [/双栈|雙棧|\bdual\s*stack\b/i, "双栈", "ip"],
   [/公网(?:IP)?|公網(?:IP)?|\bpublic\s*ip\b/i, "公网", "ip"],
+  [/运营商|運營商|電信級|电信级/i, "运营商", "ip"],
   [/\bNAT\b/i, "NAT", "ip"],
   [/\bIPv6\b/i, "IPv6", "ip"],
   [/\bIPv4\b/i, "IPv4", "ip"],
@@ -157,11 +199,17 @@ const TAG_RULES = Object.freeze([
   [/游戏|遊戲|\bgame\b/i, "游戏", "feature"],
   [/流媒体|流媒體|\bstreaming\b/i, "流媒体", "feature"],
   [/解锁|解鎖|\bunlock\b/i, "解锁", "feature"],
-  [/\b(?:Netflix|NF)\b|网飞|網飛/i, "Netflix", "feature"],
-  [/\bDisney(?:\+|\b)/i, "Disney+", "feature"],
+  [/\b(?:Netflix|NF)\b|网飞|網飛|奈飞|奈飛/i, "Netflix", "feature"],
+  [/\bDisney(?:\+|\b)|迪士尼/i, "Disney+", "feature"],
+  [/\bHBO\b/i, "HBO", "feature"],
+  [/\bHulu\b/i, "Hulu", "feature"],
+  [/\bSpotify\b/i, "Spotify", "feature"],
+  [/\bPrime\s*Video\b/i, "Prime Video", "feature"],
   [/\bYouTube\b/i, "YouTube", "feature"],
   [/\bTikTok\b|抖音海外版/i, "TikTok", "feature"],
-  [/\bChatGPT\b|\bOpenAI\b/i, "ChatGPT", "feature"],
+  [/\b(?:ChatGPT|OpenAI|GPT)\b/i, "ChatGPT", "feature"],
+  [/\bGemini\b/i, "Gemini", "feature"],
+  [/\bClaude\b/i, "Claude", "feature"],
   [/\bAI\b|人工智能|人工智慧/i, "AI", "feature"],
   [/防封|\banti[- ]?ban\b/i, "防封", "feature"],
   [/\bUDP\b/i, "UDP", "feature"],
@@ -170,6 +218,18 @@ const TAG_MASTER_RE = new RegExp(
   TAG_RULES.map(([pattern]) => `(${pattern.source})`).join("|"),
   "gi"
 );
+const TAG_PRIORITY = Object.freeze({
+  tier: 0,
+  custom: 1,
+  route: 2,
+  ip: 3,
+  feature: 4,
+  extra: 5,
+});
+const EXTRA_BRACKET_RE =
+  /\[([^\]\r\n]{1,24})\]|【([^】\r\n]{1,24})】|（([^）\r\n]{1,24})）|\(([^)\r\n]{1,24})\)/g;
+const EXTRA_FIELD_RE =
+  /(等级|等級|级别|級別|档位|檔位|套餐|计划|計劃|版型|线路|線路|特性|标签|標籤)\s*[:：=]\s*([A-Za-z0-9\u00c0-\u024f\u3400-\u9fff+_.-]{2,16})/g;
 
 const MODE_VALUES = new Set(["prefix", "suffix", "off"]);
 const PROTOCOL_LABELS = Object.freeze({
@@ -486,6 +546,7 @@ function operator(proxies = []) {
     showRoute: argBool(args.show_route, true),
     showIpType: argBool(args.show_ip_type, true),
     showFeature: argBool(args.show_feature, true),
+    showExtra: argBool(args.show_extra, true),
     showRate: argBool(args.show_rate, true),
     dedupe: argBool(args.dedupe, true),
     keepUnknown: argBool(args.keep_unknown, true),
@@ -495,7 +556,7 @@ function operator(proxies = []) {
     showRegion: argBool(args.show_region, true),
     showSeq: argBool(args.show_seq, true),
     provider: normalizeProviderName(args.provider || ""),
-    maxTags: numberArg(args.max_tags ?? args.max_line_tags, 12, 0, 24),
+    maxTags: numberArg(args.max_tags ?? args.max_line_tags, 24, 0, 32),
     customTags: parseCustomTags(args.custom_tags),
     seqWidth: numberArg(args.seq_width, 2, 1, 4),
     separator: separatorArg(args.separator, "|"),
@@ -712,23 +773,29 @@ function buildName(data, options) {
   const separator = options.separator;
   const head = [data.flag, data.provider, data.regionLabel].filter(Boolean);
   const tail = [data.rate, data.proto].filter(Boolean);
-  const fields = head.slice();
+  const selected = [];
   let length = head.join(separator).length;
   const tailLength = tail.join(separator).length;
 
-  for (const tag of data.lineTags) {
-    if (!tag) {
-      continue;
+  // 先选重要标签，再恢复其在原名中的顺序。长度限制不会吞掉靠后的等级。
+  const candidates = data.lineTags.slice().sort((a, b) =>
+    TAG_PRIORITY[a.category] - TAG_PRIORITY[b.category] || a.start - b.start
+  );
+  for (const candidate of candidates) {
+    if (selected.length >= options.maxTags) {
+      break;
     }
-    const addedLength = tag.length + (fields.length ? separator.length : 0);
+    const addedLength = candidate.label.length +
+      (head.length + selected.length ? separator.length : 0);
     const candidateLength = length + addedLength +
       (tail.length ? separator.length + tailLength : 0);
     if (candidateLength <= options.nameLength) {
-      fields.push(tag);
+      selected.push(candidate);
       length += addedLength;
     }
   }
-  fields.push(...tail);
+  selected.sort((a, b) => a.start - b.start);
+  const fields = head.concat(selected.map((item) => item.label), tail);
   return truncateText(fields.join(separator), options.nameLength);
 }
 
@@ -759,6 +826,7 @@ function normalizeProviderName(value, maxLength = 24) {
     .replace(FLAG_ALL_RE, "")
     .replace(GENERIC_REGION_ICON_RE, "")
     .replace(/[｜|]/g, " ")
+    .replace(/[【】()[\]（）{}〈〉]/g, " ")
     .replace(/^[\s|\-_/\\]+|[\s|\-_/\\]+$/g, "")
     .replace(/\s+/g, " ")
     .trim()
@@ -823,6 +891,8 @@ function providerCandidateFromPart(value) {
     if (
       regionTokens[index] ||
       /^\d{1,3}$/.test(token) ||
+      /^v\d+(?:\.\d+)*$/i.test(token) ||
+      /^\d+(?:\.\d+)?(?:ms|kbps|mbps|gbps)$/i.test(token) ||
       PROTOCOL_NAME_RE.test(token) ||
       looksLikeUsage(token) ||
       looksLikeExpire(token) ||
@@ -1130,6 +1200,29 @@ function parseCustomTags(value) {
   return result.sort((a, b) => b.length - a.length);
 }
 
+function validExtraLabel(value) {
+  const label = String(value || "").trim();
+  if (
+    label.length < 2 ||
+    label.length > 16 ||
+    !/^[A-Za-z0-9\u00c0-\u024f\u3400-\u9fff][A-Za-z0-9\u00c0-\u024f\u3400-\u9fff +_.-]*$/.test(label) ||
+    !/[A-Za-z\u00c0-\u024f\u3400-\u9fff]/.test(label) ||
+    RATE_RE.test(label) ||
+    PROTOCOL_NAME_RE.test(label) ||
+    looksLikeUsage(label) ||
+    looksLikeExpire(label) ||
+    /^v\d+(?:\.\d+)*$/i.test(label) ||
+    /\d+(?:\.\d+)?\s*(?:ms|kbps|mbps|gbps)\b/i.test(label) ||
+    /^(?:节点|節點|node|server|vps)\s*\d*$/i.test(label)
+  ) {
+    return false;
+  }
+  const normalized = normalizeRegionText(label).replace(/\d{1,3}$/, "");
+  return !REGION_EXACT_ALIASES.has(normalized) &&
+    !regionCodeFromToken(normalized) &&
+    !GLOBAL_REGION_RE.test(label);
+}
+
 function collectTagMatches(name, customTags = []) {
   const text = String(name || "");
   const matches = [];
@@ -1180,9 +1273,44 @@ function collectTagMatches(name, customTags = []) {
       }
     }
   }
-  if (customTags.length) {
-    matches.sort((a, b) => a.start - b.start || b.end - a.end);
+  EXTRA_FIELD_RE.lastIndex = 0;
+  while ((match = EXTRA_FIELD_RE.exec(text))) {
+    const label = match[2];
+    if (
+      validExtraLabel(label) &&
+      !overlaps(match.index, match.index + match[0].length)
+    ) {
+      const category = /^(?:等级|等級|级别|級別|档位|檔位|套餐|计划|計劃|版型)$/.test(match[1])
+        ? "tier"
+        : /^(?:线路|線路)$/.test(match[1]) ? "route" : "extra";
+      matches.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        label,
+        category,
+        inferred: true,
+      });
+    }
   }
+  EXTRA_BRACKET_RE.lastIndex = 0;
+  while ((match = EXTRA_BRACKET_RE.exec(text))) {
+    const label = (match[1] || match[2] || match[3] || match[4]).trim();
+    const prefix = removeFlags(text.slice(0, match.index)).trim();
+    if (
+      prefix &&
+      validExtraLabel(label) &&
+      !overlaps(match.index, match.index + match[0].length)
+    ) {
+      matches.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        label,
+        category: "extra",
+        inferred: true,
+      });
+    }
+  }
+  matches.sort((a, b) => a.start - b.start || b.end - a.end);
   return matches;
 }
 
@@ -1196,18 +1324,20 @@ function detectTags(matches, options) {
     ip: options.showIpType,
     feature: options.showFeature,
     custom: true,
+    extra: options.showExtra,
   };
   const labels = [];
   const seen = new Set();
   for (const match of matches) {
-    if (!enabled[match.category] || seen.has(match.label)) {
+    if (
+      !enabled[match.category] ||
+      (match.inferred && !options.showExtra) ||
+      seen.has(match.label)
+    ) {
       continue;
     }
     seen.add(match.label);
-    labels.push(match.label);
-    if (labels.length >= options.maxTags) {
-      break;
-    }
+    labels.push(match);
   }
   return labels;
 }

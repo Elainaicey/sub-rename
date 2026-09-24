@@ -51,6 +51,62 @@ test("标准、实验性、备用、隧道等补充描述可单独保留", () =>
   );
 });
 
+test("扩展等级保留各自区别，不合并为泛化标签", () => {
+  const [name] = rename([{
+    name: "Cloud 香港 尊享 铂金 PRO 实验 内测",
+    type: "ss",
+  }]);
+  assert.equal(
+    name,
+    "🇭🇰|Cloud|香港01|尊享|铂金|专业|实验|内测|SS"
+  );
+});
+
+test("数量限制与名称长度限制均优先保留靠后的等级", () => {
+  const input = [{
+    name: "Cloud 香港 IEPL IPLC BGP 住宅 ChatGPT 低延迟 标准 实验性",
+    type: "ss",
+  }];
+  assert.equal(
+    rename(input, { max_tags: 2 })[0],
+    "🇭🇰|Cloud|香港01|标准|实验性|SS"
+  );
+  const [short] = rename(input, { name_len: 37 });
+  assert.match(short, /\|标准\|实验性\|SS$/);
+});
+
+test("保留后置括号中的未收录描述，忽略地区、序号和协议括号", () => {
+  const [name] = rename([{
+    name: "Cloud 香港【樱花专享】[02](trojan)",
+    type: "ss",
+  }]);
+  assert.equal(name, "🇭🇰|Cloud|香港01|樱花专享|SS");
+  assert.equal(
+    rename([{ name: "香港【高级】", type: "ss" }])[0],
+    "🇭🇰|UNKNOWN|香港01|高级|SS"
+  );
+  assert.equal(
+    rename([{
+      name: "【Cloud】 香港【樱花专享】[香港][v2][20ms]",
+      type: "ss",
+    }])[0],
+    "🇭🇰|Cloud|香港01|樱花专享|SS"
+  );
+});
+
+test("明示等级和线路字段可提取未收录的自定义名称", () => {
+  const [name] = rename([{
+    name: "Cloud 香港 等级:星耀 线路:樱花加速 IEPL",
+    type: "ss",
+  }]);
+  assert.equal(name, "🇭🇰|Cloud|香港01|星耀|樱花加速|IEPL|SS");
+  const [withoutExtra] = rename([{
+    name: "Cloud 香港 等级:星耀",
+    type: "ss",
+  }], { show_extra: 0 });
+  assert.equal(withoutExtra, "🇭🇰|Cloud|香港01|SS");
+});
+
 test("可按类别关闭标签，也支持自定义标签", () => {
   const [name] = rename([{
     name: "香港 高级 专线 住宅 游戏 极光加速",
