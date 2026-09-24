@@ -1,22 +1,24 @@
 /**
  * @Sub-Store-Page
  *
- * CloudRename v1.0.0
- * 高性能机场节点分类、过滤与重命名脚本
+ * CloudRename v1.1.0
+ * 本地机场节点分类、信息提取与重命名脚本
  *
  * 输出格式：
- * 国旗|机场名|地区序号|线路标签|倍率|协议
+ * 国旗|机场名|地区序号|等级/线路/IP 属性/用途|倍率|协议
  *
  * 示例：
  * 🇭🇰|XSUS|香港01|0.8x|ANYTLS
  * 🇭🇰|FlowerCloud|香港01|实验性|IEPL|专线|TROJAN
  *
- * v1.0.0 优化：
+ * v1.1.0 优化：
  * - 不检测落地 IP，不请求任何外部 API
  * - 地区别名只标准化一次，大订阅自动切换为 O(节点名长度) 的自动机匹配
  * - 精确代码、机场代码、国旗、长别名和节点元数据组成分层识别路径
  * - 修复 CN2 被识别为中国、IN01/IT01/NO01/IS01 漏判等边界问题
- * - 过滤规则、线路规则、倍率规则全部预编译
+ * - 从节点名提取等级、线路、IP 属性、用途、倍率和自定义标签
+ * - 标签按原名出现顺序输出，长名称优先保留倍率与协议
+ * - 过滤规则、标签规则、倍率规则全部预编译
  * - 协议/传输/TLS/REALITY 合并输出，支持更多 Sub-Store 字段
  * - 同名节点使用无碰撞去重，长名称也会为 #2/#3 完整预留空间
  * - mode=off 时真正不修改名称，也不会再被 dedupe 追加 #2/#3
@@ -27,12 +29,18 @@
  * drop_info=1       过滤流量/到期/官网/通知类伪节点，默认 1
  * mode=prefix       prefix=覆盖为新名；suffix=追加到原名后；off=不改名
  * show_proto=1      显示协议，默认 1
- * show_line=1       显示线路标签，默认 1
+ * show_line=1       显示所有描述标签的总开关，默认 1
+ * show_tier=1       显示高级/标准/旗舰/实验性等等级标签
+ * show_route=1      显示 IEPL/IPLC/CN2/专线/中转等线路标签
+ * show_ip_type=1    显示住宅/家宽/原生/独享/动态等 IP 属性
+ * show_feature=1    显示游戏/流媒体/AI/备用/低延迟等用途标签
  * show_rate=1       显示倍率，默认 1
  * dedupe=1          重名节点追加 #2/#3，默认 1；mode=off 时不生效
  * provider=xxx      手动覆盖机场名
  * keep_unknown=1    保留未识别地区节点，默认 1
- * max_line_tags=4   最多保留几个线路标签，默认 4
+ * max_tags=12       最多保留的描述标签数，默认 12
+ * max_line_tags=12  max_tags 的兼容别名
+ * custom_tags=xxx   额外关键词，逗号分隔，如 静态住宅,精品线路
  * use_metadata=1    名称未命中时读取节点国家/地区元数据，默认 1
  * show_flag=1       显示国旗，默认 1
  * show_provider=1   显示机场名，默认 1
@@ -44,10 +52,10 @@
  * debug=0           输出耗时、过滤及识别统计
  *
  * 推荐参数：
- * #drop_info=1&mode=prefix&show_proto=1&show_line=1&show_rate=1&dedupe=1&keep_unknown=1&use_metadata=1
+ * #drop_info=1&mode=prefix&show_line=1&max_tags=12&show_rate=1&show_proto=1&dedupe=1
  */
 
-const SCRIPT_VERSION = "1.0.0";
+const SCRIPT_VERSION = "1.1.0";
 
 const UNKNOWN_REGION = Object.freeze({
   code: "OT",
@@ -86,27 +94,82 @@ const EXPIRE_RE =
   /(?:\d+\s*(?:D|天|日)|\d+\s*(?:H|时|小时)|到期|过期|剩余|(?:^|[^a-z])(?:expire|expired|expiration)(?=$|[^a-z]))/i;
 
 const RATE_RE =
-  /(?:倍率|rate)\s*[:：=]?\s*[x×*]?\s*(\d+(?:\.\d+)?)|(?:^|[\s|｜_\-/\\[(（])(?:x|×|\*)\s*(\d+(?:\.\d+)?)(?=$|[\s|｜_\-/\\\])）])|(\d+(?:\.\d+)?)\s*(?:倍率|倍|x|×)(?=$|[\s|｜_\-/\\\])）])/i;
+  /(?:倍率|rate|倍速)\s*[:：=]?\s*[x×*]?\s*(\d+(?:\.\d+)?)|(?:^|[\s|｜_\-/\\[(（])(?:x|×|\*)\s*(\d+(?:\.\d+)?)(?=$|[\s|｜_\-/\\\])）])|(\d+(?:\.\d+)?)\s*(?:倍率|倍|x|×)(?=$|[\s|｜_\-/\\\])）])/i;
 
-const LINE_TAG_RULES = Object.freeze([
-  [/实验性|實驗性|experimental/i, "实验性"],
-  [/\bIEPL\b/i, "IEPL"],
-  [/\bIPLC\b/i, "IPLC"],
-  [/\bBGP\b/i, "BGP"],
-  [/\bCN2\s*GIA\b/i, "CN2 GIA"],
-  [/\bCN2\b(?!\s*GIA)/i, "CN2"],
-  [/\bCMIN?2\b/i, "CMIN2"],
-  [/\bCMI\b/i, "CMI"],
-  [/\b(?:AS)?9929\b/i, "AS9929"],
-  [/\b(?:AS)?4837\b/i, "AS4837"],
-  [/\bCU\s*(?:VIP|II)\b/i, "CU VIP"],
-  [/专线|專線|premium/i, "专线"],
-  [/中转|中轉|中繼|relay|隧道|tunnel/i, "中转"],
-  [/直连|直連|direct/i, "直连"],
-  [/家宽|家寬|住宅|原生|residential|isp/i, "住宅"],
-  [/游戏|遊戲|game/i, "游戏"],
-  [/流媒体|流媒體|解锁|解鎖|unlock|netflix|\bnf\b|disney|youtube/i, "流媒体"],
+// 具体线路先于通用线路，避免 CN2 GIA 同时产出 CN2。
+const TAG_RULES = Object.freeze([
+  [/\bCN2\s*GIA\b/i, "CN2 GIA", "route"],
+  [/\bCN2\b/i, "CN2", "route"],
+  [/\bIEPL\b/i, "IEPL", "route"],
+  [/\bIPLC\b/i, "IPLC", "route"],
+  [/\bCMIN?2\b/i, "CMIN2", "route"],
+  [/\bCMI\b/i, "CMI", "route"],
+  [/\b(?:AS)?9929\b/i, "AS9929", "route"],
+  [/\b(?:AS)?4837\b/i, "AS4837", "route"],
+  [/\bCU\s*(?:VIP|II)\b/i, "CU VIP", "route"],
+  [/\bBGP\b/i, "BGP", "route"],
+  [/专线|專線|\b(?:dedicated|private)\s+line\b/i, "专线", "route"],
+  [/中转|中轉|中繼|\brelay\b/i, "中转", "route"],
+  [/隧道|\btunnel\b/i, "隧道", "route"],
+  [/直连|直連|\bdirect\b/i, "直连", "route"],
+  [/落地|\bexit\s*(?:node|server)?\b/i, "落地", "route"],
+  [/入口|\bentry\s*(?:node|server)?\b/i, "入口", "route"],
+  [/实验性|實驗性|\bexperimental\b/i, "实验性", "tier"],
+  [/测试|測試|\b(?:test|beta)\b/i, "测试", "tier"],
+  [/旗舰|旗艦|\bflagship\b/i, "旗舰", "tier"],
+  [/高级|高級|\bpremium\b/i, "高级", "tier"],
+  [/标准|標準|\bstandard\b/i, "标准", "tier"],
+  [/精品|\belite\b/i, "精品", "tier"],
+  [/基础|基礎|入门|入門|\bbasic\b/i, "基础", "tier"],
+  [/普通|\bnormal\b/i, "普通", "tier"],
+  [/\bSVIP\b/i, "SVIP", "tier"],
+  [/\bVIP\b/i, "VIP", "tier"],
+  [/企业|企業|\benterprise\b/i, "企业", "tier"],
+  [/商务|商務|\bbusiness\b/i, "商务", "tier"],
+  [/轻量|輕量|\blite\b/i, "轻量", "tier"],
+  [/免费|\bfree\b/i, "免费", "tier"],
+  [/双ISP|雙ISP|\bdual\s*isp\b/i, "双ISP", "ip"],
+  [/\bISP\b/i, "ISP", "ip"],
+  [/家宽|家寬|\bhome\s*(?:broadband|ip)\b/i, "家宽", "ip"],
+  [/住宅(?:IP)?|\bresidential(?:\s*ip)?\b/i, "住宅", "ip"],
+  [/原生(?:IP)?|\bnative\s*ip\b/i, "原生", "ip"],
+  [/商宽|商寬|\bbusiness\s*broadband\b/i, "商宽", "ip"],
+  [/数据中心|數據中心|机房|機房|\b(?:datacenter|data\s*center)\b/i, "机房", "ip"],
+  [/独享|獨享|独立IP|獨立IP|\bdedicated\s*ip\b/i, "独享", "ip"],
+  [/共享|共用|\bshared\s*ip\b/i, "共享", "ip"],
+  [/动态(?:IP)?|動態(?:IP)?|\bdynamic\s*ip\b/i, "动态", "ip"],
+  [/静态(?:IP)?|靜態(?:IP)?|\bstatic\s*ip\b/i, "静态", "ip"],
+  [/广播(?:IP)?|廣播(?:IP)?|\bbroadcast\s*ip\b/i, "广播", "ip"],
+  [/双栈|雙棧|\bdual\s*stack\b/i, "双栈", "ip"],
+  [/公网(?:IP)?|公網(?:IP)?|\bpublic\s*ip\b/i, "公网", "ip"],
+  [/\bNAT\b/i, "NAT", "ip"],
+  [/\bIPv6\b/i, "IPv6", "ip"],
+  [/\bIPv4\b/i, "IPv4", "ip"],
+  [/低延迟|低延遲|\blow\s*latency\b/i, "低延迟", "feature"],
+  [/高速|极速|極速|\bfast\b/i, "高速", "feature"],
+  [/稳定|穩定|\bstable\b/i, "稳定", "feature"],
+  [/备用|備用|\bbackup\b/i, "备用", "feature"],
+  [/优化|優化|\boptimized\b/i, "优化", "feature"],
+  [/大带宽|高带宽|大頻寬|高頻寬|\bhigh\s*bandwidth\b/i, "大带宽", "feature"],
+  [/高防|\bDDoS\s*protection\b/i, "高防", "feature"],
+  [/负载均衡|負載均衡|\bload\s*balancing\b/i, "负载均衡", "feature"],
+  [/白名单|白名單|\bwhitelist\b/i, "白名单", "feature"],
+  [/游戏|遊戲|\bgame\b/i, "游戏", "feature"],
+  [/流媒体|流媒體|\bstreaming\b/i, "流媒体", "feature"],
+  [/解锁|解鎖|\bunlock\b/i, "解锁", "feature"],
+  [/\b(?:Netflix|NF)\b|网飞|網飛/i, "Netflix", "feature"],
+  [/\bDisney(?:\+|\b)/i, "Disney+", "feature"],
+  [/\bYouTube\b/i, "YouTube", "feature"],
+  [/\bTikTok\b|抖音海外版/i, "TikTok", "feature"],
+  [/\bChatGPT\b|\bOpenAI\b/i, "ChatGPT", "feature"],
+  [/\bAI\b|人工智能|人工智慧/i, "AI", "feature"],
+  [/防封|\banti[- ]?ban\b/i, "防封", "feature"],
+  [/\bUDP\b/i, "UDP", "feature"],
 ]);
+const TAG_MASTER_RE = new RegExp(
+  TAG_RULES.map(([pattern]) => `(${pattern.source})`).join("|"),
+  "gi"
+);
 
 const MODE_VALUES = new Set(["prefix", "suffix", "off"]);
 const PROTOCOL_LABELS = Object.freeze({
@@ -120,8 +183,6 @@ const PROTOCOL_LABELS = Object.freeze({
 });
 const PROTOCOL_NAME_RE =
   /^(?:vless|vmess|trojan|ss|ssr|shadowsocks|hysteria2?|hy2|tuic|anytls|wireguard|socks5?|http)$/i;
-const LINE_DESCRIPTOR_TOKEN_RE =
-  /^(?:experimental|iepl|iplc|bgp|cn2|gia|cmin?2|cmi|(?:as)?9929|(?:as)?4837|premium|relay|tunnel|direct|residential|isp|game|unlock|netflix|nf|disney|youtube|实验性|實驗性|专线|專線|中转|中轉|中繼|隧道|直连|直連|家宽|家寬|住宅|原生|游戏|遊戲|流媒体|流媒體|解锁|解鎖)$/i;
 const REGION_PART_SPLIT_RE = /[\s|｜_\-/\\:：,，.;；()[\]{}<>]+/;
 const NUMBERED_TOKEN_RE = /^([a-z]{2,3})(\d{1,3})$/;
 const LATIN_DIACRITIC_RE = /[\u00c0-\u024f\u1e00-\u1eff]/;
@@ -421,6 +482,10 @@ function operator(proxies = []) {
     mode,
     showProto: argBool(args.show_proto, true),
     showLine: argBool(args.show_line, true),
+    showTier: argBool(args.show_tier, true),
+    showRoute: argBool(args.show_route, true),
+    showIpType: argBool(args.show_ip_type, true),
+    showFeature: argBool(args.show_feature, true),
     showRate: argBool(args.show_rate, true),
     dedupe: argBool(args.dedupe, true),
     keepUnknown: argBool(args.keep_unknown, true),
@@ -430,7 +495,8 @@ function operator(proxies = []) {
     showRegion: argBool(args.show_region, true),
     showSeq: argBool(args.show_seq, true),
     provider: normalizeProviderName(args.provider || ""),
-    maxLineTags: numberArg(args.max_line_tags, 4, 0, 10),
+    maxTags: numberArg(args.max_tags ?? args.max_line_tags, 12, 0, 24),
+    customTags: parseCustomTags(args.custom_tags),
     seqWidth: numberArg(args.seq_width, 2, 1, 4),
     separator: separatorArg(args.separator, "|"),
     nameLength: numberArg(args.name_len, 95, 32, 256),
@@ -536,11 +602,14 @@ function operator(proxies = []) {
       continue;
     }
 
+    const tagMatches = options.showLine && options.maxTags > 0
+      ? collectTagMatches(oldName, options.customTags)
+      : null;
     const needsProvider =
       options.showProvider ||
       (options.showRegion && options.showSeq);
     const provider = needsProvider
-      ? providerFromNode(proxy, options.provider, providerCache)
+      ? providerFromNode(proxy, options.provider, providerCache, tagMatches, options.customTags)
       : "";
 
     let regionLabel = "";
@@ -563,9 +632,9 @@ function operator(proxies = []) {
       provider: options.showProvider ? provider : "",
       regionLabel,
       lineTags: options.showLine
-        ? detectLineTags(oldName, options.maxLineTags)
+        ? detectTags(tagMatches || [], options)
         : [],
-      rate: options.showRate ? detectRate(oldName) : "",
+      rate: options.showRate ? detectRate(oldName, proxy) : "",
       proto: options.showProto ? protoLabel(proxy) : "",
     }, options);
 
@@ -640,32 +709,27 @@ function truncateText(value, maxLength) {
 }
 
 function buildName(data, options) {
-  const fields = [];
-  if (data.flag) {
-    fields.push(data.flag);
-  }
-  if (data.provider) {
-    fields.push(data.provider);
-  }
-  if (data.regionLabel) {
-    fields.push(data.regionLabel);
-  }
+  const separator = options.separator;
+  const head = [data.flag, data.provider, data.regionLabel].filter(Boolean);
+  const tail = [data.rate, data.proto].filter(Boolean);
+  const fields = head.slice();
+  let length = head.join(separator).length;
+  const tailLength = tail.join(separator).length;
+
   for (const tag of data.lineTags) {
-    if (tag) {
+    if (!tag) {
+      continue;
+    }
+    const addedLength = tag.length + (fields.length ? separator.length : 0);
+    const candidateLength = length + addedLength +
+      (tail.length ? separator.length + tailLength : 0);
+    if (candidateLength <= options.nameLength) {
       fields.push(tag);
+      length += addedLength;
     }
   }
-  if (data.rate) {
-    fields.push(data.rate);
-  }
-  if (data.proto) {
-    fields.push(data.proto);
-  }
-
-  return truncateText(
-    fields.join(options.separator),
-    options.nameLength
-  );
+  fields.push(...tail);
+  return truncateText(fields.join(separator), options.nameLength);
 }
 
 function applyMode(oldName, tag, mode, nameLength) {
@@ -677,12 +741,15 @@ function applyMode(oldName, tag, mode, nameLength) {
     if (old === tag || old.endsWith(` ${tag}`)) {
       return truncateText(old, nameLength);
     }
-    return truncateText(`${old} ${tag}`.trim(), nameLength);
+    const available = nameLength - tag.length - 1;
+    return available > 0
+      ? `${truncateText(old, available).trim()} ${tag}`.trim()
+      : truncateText(tag, nameLength);
   }
   return truncateText(tag, nameLength);
 }
 
-function normalizeProviderName(value) {
+function normalizeProviderName(value, maxLength = 24) {
   const raw = String(value || "").trim();
   if (!raw) {
     return "";
@@ -695,11 +762,15 @@ function normalizeProviderName(value) {
     .replace(/^[\s|\-_/\\]+|[\s|\-_/\\]+$/g, "")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 24);
+    .slice(0, maxLength);
 }
 
 function providerCandidateFromPart(value) {
-  const part = normalizeProviderName(value);
+  const part = normalizeProviderName(value, 256)
+    .replace(RATE_RE, " ")
+    .replace(/(?:线路|線路|节点|節點|\b(?:node|server|vps)\b)\s*\d{0,3}/ig, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!part) {
     return "";
   }
@@ -753,7 +824,6 @@ function providerCandidateFromPart(value) {
       regionTokens[index] ||
       /^\d{1,3}$/.test(token) ||
       PROTOCOL_NAME_RE.test(token) ||
-      LINE_DESCRIPTOR_TOKEN_RE.test(token) ||
       looksLikeUsage(token) ||
       looksLikeExpire(token) ||
       detectRate(token)
@@ -765,7 +835,7 @@ function providerCandidateFromPart(value) {
   return normalizeProviderName(providerTokens.join(" "));
 }
 
-function providerFromNode(proxy, manualProvider, cache) {
+function providerFromNode(proxy, manualProvider, cache, tagMatches, customTags) {
   if (manualProvider) {
     return manualProvider;
   }
@@ -789,7 +859,14 @@ function providerFromNode(proxy, manualProvider, cache) {
     return normalized;
   }
 
-  const parts = String(proxy?.name || "").split(/[|｜\-_/\\]+/);
+  const oldName = String(proxy?.name || "");
+  const matches = tagMatches || collectTagMatches(oldName, customTags);
+  let cleanName = oldName;
+  for (let index = matches.length - 1; index >= 0; index--) {
+    const match = matches[index];
+    cleanName = `${cleanName.slice(0, match.start)} ${cleanName.slice(match.end)}`;
+  }
+  const parts = cleanName.split(/[|｜\-_/\\]+/);
 
   for (const rawPart of parts) {
     const part = providerCandidateFromPart(rawPart);
@@ -1036,30 +1113,110 @@ function flagToCC(text) {
   );
 }
 
-function detectLineTags(name, maxTags = 4) {
-  if (maxTags <= 0) {
-    return [];
-  }
-  const text = String(name || "");
-  const tags = [];
-  for (const [pattern, tag] of LINE_TAG_RULES) {
-    if (pattern.test(text)) {
-      tags.push(tag);
-      if (tags.length >= maxTags) {
+function parseCustomTags(value) {
+  const result = [];
+  const seen = new Set();
+  for (const item of String(value || "").split(/[,，;；]/)) {
+    const tag = item.trim().slice(0, 24);
+    const key = tag.toLowerCase();
+    if (tag && !seen.has(key)) {
+      seen.add(key);
+      result.push(tag);
+      if (result.length >= 20) {
         break;
       }
     }
   }
-  return tags;
+  return result.sort((a, b) => b.length - a.length);
 }
 
-function detectRate(name) {
+function collectTagMatches(name, customTags = []) {
+  const text = String(name || "");
+  const matches = [];
+  const overlaps = (start, end) =>
+    matches.some((match) => start < match.end && end > match.start);
+
+  // 自定义复合词优先，允许把“静态住宅”保留为一个完整标签。
+  if (customTags.length) {
+    const lower = text.toLowerCase();
+    for (const label of customTags) {
+      const term = label.toLowerCase();
+      let start = lower.indexOf(term);
+      while (start !== -1) {
+        const end = start + term.length;
+        const asciiFirst = /[a-z0-9]/i.test(term[0]);
+        const asciiLast = /[a-z0-9]/i.test(term[term.length - 1]);
+        const leftOk = !asciiFirst || start === 0 ||
+          !/[a-z0-9]/i.test(lower[start - 1]);
+        const rightOk = !asciiLast || end === lower.length ||
+          !/[a-z0-9]/i.test(lower[end]);
+        if (leftOk && rightOk && !overlaps(start, end)) {
+          matches.push({ start, end, label, category: "custom" });
+        }
+        start = lower.indexOf(term, end);
+      }
+    }
+  }
+  let searchable = text;
+  if (matches.length) {
+    const chars = text.split("");
+    for (const { start, end } of matches) {
+      chars.fill(" ", start, end);
+    }
+    searchable = chars.join("");
+  }
+  TAG_MASTER_RE.lastIndex = 0;
+  let match;
+  while ((match = TAG_MASTER_RE.exec(searchable))) {
+    for (let index = 0; index < TAG_RULES.length; index++) {
+      if (match[index + 1] !== undefined) {
+        matches.push({
+          start: match.index,
+          end: match.index + match[0].length,
+          label: TAG_RULES[index][1],
+          category: TAG_RULES[index][2],
+        });
+        break;
+      }
+    }
+  }
+  if (customTags.length) {
+    matches.sort((a, b) => a.start - b.start || b.end - a.end);
+  }
+  return matches;
+}
+
+function detectTags(matches, options) {
+  if (options.maxTags <= 0) {
+    return [];
+  }
+  const enabled = {
+    route: options.showRoute,
+    tier: options.showTier,
+    ip: options.showIpType,
+    feature: options.showFeature,
+    custom: true,
+  };
+  const labels = [];
+  const seen = new Set();
+  for (const match of matches) {
+    if (!enabled[match.category] || seen.has(match.label)) {
+      continue;
+    }
+    seen.add(match.label);
+    labels.push(match.label);
+    if (labels.length >= options.maxTags) {
+      break;
+    }
+  }
+  return labels;
+}
+
+function detectRate(name, proxy) {
   const text = String(name || "");
   const match = RATE_RE.exec(text);
-  if (!match) {
-    return "";
-  }
-  const rate = Number(match[1] || match[2] || match[3]);
+  const metadata = proxy?._multiplier ?? proxy?._rate ?? proxy?.multiplier;
+  const rate = Number(match ? match[1] || match[2] || match[3] : metadata);
   return Number.isFinite(rate) && rate > 0 && rate <= 1000
     ? `${rate}x`
     : "";

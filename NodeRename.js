@@ -1,7 +1,7 @@
 /**
  * @Sub-Store-Page
  *
- * NodeRename v1.0.1
+ * NodeRename v1.0.2
  * 高性能落地出口检测与节点重命名脚本
  *
  * 默认输出：
@@ -14,6 +14,7 @@
  * 4. 分离“节点配置 -> 出口”和“出口 IP -> 元数据”缓存，修改命名参数不会复用错误标签。
  * 5. 默认使用 ASN 国家快速推测原生/广播；只有缺少 ASN 国家时才请求 RIPE。
  * 6. v1.0.1 升级缓存结构并自动丢弃旧版国家缓存，首次运行会重新探测。
+ * 7. v1.0.2 修复 suffix 长原名截掉出口标签，并避免截断 Unicode 代理对。
  *
  * 推荐参数：
  * #concurrency=6&probe_source=auto&geo_source=ipinfo&native_source=auto&node_ttl=6&ttl=72&stale_ttl=168&mode=prefix&dedupe=1&debug=0
@@ -74,7 +75,7 @@
  * 不等同于运营商或数据库的正式“原生 IP”认证。
  */
 
-const SCRIPT_VERSION = "1.0.1";
+const SCRIPT_VERSION = "1.0.2";
 const CACHE_KEY = "node_rename_cache_v1";
 const CACHE_SCHEMA = 2;
 const UNKNOWN = "未知";
@@ -697,6 +698,19 @@ function protoLabel(proxy) {
   return [type, network, security].filter(Boolean).join("-") || UNKNOWN_VENDOR;
 }
 
+function truncateText(value, maxLength) {
+  const text = String(value || "");
+  if (text.length <= maxLength) {
+    return text;
+  }
+  let result = text.slice(0, maxLength);
+  const lastCode = result.charCodeAt(result.length - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
+
 function buildName(geo, local, options) {
   const fields = [flagEmoji(geo?.geoCC)];
   if (options.showProvider) {
@@ -717,11 +731,13 @@ function buildName(geo, local, options) {
   if (options.showIp) {
     fields.push(geo?.ip || "NO-IP");
   }
-  return fields
-    .map((value) => String(value || "").trim())
-    .filter(Boolean)
-    .join(options.separator)
-    .slice(0, options.nameLength);
+  return truncateText(
+    fields
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+      .join(options.separator),
+    options.nameLength
+  );
 }
 
 function applyMode(oldName, tag, mode, nameLength) {
@@ -730,19 +746,25 @@ function applyMode(oldName, tag, mode, nameLength) {
   }
   if (mode === "suffix") {
     const old = String(oldName || "");
-    if (old === tag || old.endsWith(` ${tag}`)) {
-      return old.slice(0, nameLength);
+    if (old === tag) {
+      return truncateText(tag, nameLength);
     }
-    return `${old} ${tag}`.trim().slice(0, nameLength);
+    const prefix = old.endsWith(` ${tag}`)
+      ? old.slice(0, -tag.length - 1)
+      : old;
+    const available = nameLength - tag.length - 1;
+    return available > 0
+      ? `${truncateText(prefix, available).trim()} ${tag}`.trim()
+      : truncateText(tag, nameLength);
   }
-  return tag.slice(0, nameLength);
+  return truncateText(tag, nameLength);
 }
 
 function dedupeNames(proxies, nameLength) {
   const used = new Set();
   const counters = new Map();
   for (const proxy of proxies) {
-    const base = String(proxy?.name || "").slice(0, nameLength);
+    const base = truncateText(proxy?.name || "", nameLength);
     if (!used.has(base)) {
       used.add(base);
       counters.set(base, 1);
@@ -755,8 +777,8 @@ function dedupeNames(proxies, nameLength) {
     do {
       count++;
       const suffix = `#${count}`;
-      candidate = `${base.slice(
-        0,
+      candidate = `${truncateText(
+        base,
         Math.max(0, nameLength - suffix.length)
       )}${suffix}`;
     } while (used.has(candidate));
